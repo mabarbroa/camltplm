@@ -1,126 +1,199 @@
+// main.js — Rooster Auto Swap PLUME -> pUSD (Plume Mainnet 98866)
+// Node 18+, ESM. Pastikan package.json ada: { "type": "module" }
 import 'dotenv/config';
 import { readFileSync } from 'fs';
+import { setTimeout as wait } from 'timers/promises';
 import { ethers } from 'ethers';
 
-// ======== CONFIG ========
-const RPC = process.env.PLUME_RPC?.trim() || 'https://phoenix-rpc.plumenetwork.xyz'; // Plume RPC
+// ======== ENV & Default ========
+const {
+  PLUME_RPC = 'https://rpc.plume.org',
+  LOOPS = '1',
+  DELAY_MIN_SEC = '5',
+  DELAY_MAX_SEC = '20',
+  SLIPPAGE_PERCENT = '0.7',
+  GAS_RESERVE_PLUME = '0.005',
+
+  // Versi fix: default pakai range 0.5–1 PLUME
+  AMOUNT_MODE = 'range',      // 'range' | 'fixed' | 'percent' | 'all'
+  MIN_PLUME = '0.5',          // dipakai saat AMOUNT_MODE=range
+  MAX_PLUME = '1',
+  FIXED_PLUME = '0.01',       // fallback jika AMOUNT_MODE='fixed'
+  PERCENT_BALANCE = '50'      // fallback jika AMOUNT_MODE='percent'
+} = process.env;
+
+// ======== Konstanta Plume ========
 const CHAIN_ID = 98866;
+const ZERO = '0x0000000000000000000000000000000000000000'; // native PLUME
+const PUSD = '0xdddD73F5Df1F0DC31373357beAC77545dC5A6f3F';
 
-// Addresses (Camelot Plume)
-const ROUTER_V2 = '0x10aA510d94E094Bd643677bd2964c3EE085Daffc';
-const WPLUME   = '0xEa237441c92CAe6FC17Caaf9a7acB3f953be4bd1';
-const PUSD     = '0xdddD73F5Df1F0DC31373357beAC77545dC5A6f3F';
+// Rooster API
+const CALLDATA_API = 'https://api.rooster-protocol.xyz/api/swap/callData';
 
-// Amount control
-// Pakai salah satu: AMOUNT_PLUME atau MIN_PLUME..MAX_PLUME (random)
-const AMOUNT_PLUME = process.env.AMOUNT_PLUME ? Number(process.env.AMOUNT_PLUME) : null; // mis. 0.02
-const MIN_PLUME    = process.env.MIN_PLUME ? Number(process.env.MIN_PLUME) : 0.01;
-const MAX_PLUME    = process.env.MAX_PLUME ? Number(process.env.MAX_PLUME) : 0.02;
+// ======== Provider ========
+const provider = new ethers.JsonRpcProvider(PLUME_RPC, {
+  chainId: CHAIN_ID,
+  name: 'plume',
+});
 
-// Slippage (persen)
-const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100; // 1%
-// Deadline (menit)
-const DEADLINE_MIN = process.env.DEADLINE_MIN ? Number(process.env.DEADLINE_MIN) : 15;
-
-// Delay antar swap (detik)
-const DELAY_MIN_S = 5;
-const DELAY_MAX_S = 20;
-
-// ======== ABIs ========
-const ROUTER_V2_ABI = [
-  // read
-  'function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)',
-  // write
-  'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable',
-];
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-function pickAmount() {
-  if (AMOUNT_PLUME && AMOUNT_PLUME > 0) return AMOUNT_PLUME;
-  const f = rand(Math.round(MIN_PLUME * 1e6), Math.round(MAX_PLUME * 1e6)) / 1e6;
-  return Number(f.toFixed(6));
+// ======== Utils ========
+function readPrivateKeys(path = 'account.txt') {
+  const raw = readFileSync(path, 'utf8')
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  return raw;
 }
-function normPK(line) {
-  const t = line.trim();
-  if (!t) return null;
-  return t.startsWith('0x') ? t : '0x' + t;
+function randInt(min, max) {
+  const a = Math.ceil(min), b = Math.floor(max);
+  return Math.floor(Math.random() * (b - a + 1)) + a;
+}
+function randFloat(min, max, dp = 6) {
+  const v = Math.random() * (max - min) + min;
+  return Number(v.toFixed(dp));
+}
+async function delayRandom() {
+  const sec = randInt(Number(DELAY_MIN_SEC), Number(DELAY_MAX_SEC));
+  console.log(`  … delay ${sec}s`);
+  await wait(sec * 1000);
+}
+async function ensureChain() {
+  const nw = await provider.getNetwork();
+  const cid = Number(nw.chainId);
+  if (cid !== CHAIN_ID) {
+    throw new Error(`Salah network. Dapat: ${cid}, harus ${CHAIN_ID} (Plume mainnet)`);
+  }
 }
 
-async function swapOneWallet(pk, provider) {
-  const wallet = new ethers.Wallet(pk, provider);
-  const router = new ethers.Contract(ROUTER_V2, ROUTER_V2_ABI, wallet);
+// ======== Penentuan Amount ========
+function pickAmountWei(balanceWei) {
+  const reserve = ethers.parseEther(GAS_RESERVE_PLUME);
+  const avail = balanceWei > reserve ? (balanceWei - reserve) : 0n;
+  if (avail <= 0n) return 0n;
 
-  // cek chainId
-  const { chainId } = await provider.getNetwork();
-  if (Number(chainId) !== CHAIN_ID) {
-    throw new Error(`Wrong chainId: got ${chainId}, expected ${CHAIN_ID}`);
+  if (AMOUNT_MODE === 'all') return avail;
+
+  if (AMOUNT_MODE === 'percent') {
+    const pct = Math.max(0, Math.min(100, Number(PERCENT_BALANCE)));
+    const wei = (avail * BigInt(Math.floor(pct * 100))) / 10000n;
+    return wei <= 0n ? 0n : wei;
   }
 
-  // amount & path
-  const amountInEth = pickAmount();
-  const value = ethers.parseEther(amountInEth.toString());
-  const path = [WPLUME, PUSD];
+  if (AMOUNT_MODE === 'range') {
+    const minP = Math.max(0, Number(MIN_PLUME));
+    const maxP = Math.max(minP, Number(MAX_PLUME));
+    const pick = randFloat(minP, maxP, 6);
+    let wei = ethers.parseEther(String(pick));
+    if (wei > avail) wei = avail; // clamp kalau saldo kurang
+    return wei <= 0n ? 0n : wei;
+  }
 
-  // cek saldo native
-  const bal = await provider.getBalance(wallet.address);
-  if (bal < value) {
-    console.log(`  ✖ ${wallet.address} saldo kurang. Balance: ${ethers.formatEther(bal)} PLUME`);
+  // default 'fixed'
+  let fixed = ethers.parseEther(FIXED_PLUME);
+  if (fixed > avail) fixed = avail;
+  return fixed <= 0n ? 0n : fixed;
+}
+
+// ======== Rooster CallData ========
+async function buildCallData({ amountWei, recipient }) {
+  const body = {
+    inputTokenAddress: ZERO,           // native PLUME
+    outputTokenAddress: PUSD,          // pUSD
+    recipientAddress: recipient,       // penerima
+    amount: amountWei.toString(),      // wei
+    slippage: Number(SLIPPAGE_PERCENT),
+    amountOutMinimum: ''               // biar dihitung API berdasar slippage
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(CALLDATA_API, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        console.log(`  ⚠ CallData API gagal (attempt ${attempt}): ${res.status} ${txt}`);
+        if (attempt === 2) throw new Error(`CallData API error ${res.status}`);
+        await wait(1200);
+        continue;
+      }
+      const json = await res.json();
+      if (!json?.to || !json?.callData) throw new Error('Response callData tidak lengkap');
+      return {
+        to: json.to,
+        data: json.callData,
+        value: BigInt(json.value ?? amountWei.toString()), // hex/dec ok
+        expectedOutput: json.expectedOutput,
+        minOut: json.amountOutMinimum,
+        slippage: json.slippage,
+      };
+    } catch (e) {
+      if (attempt === 2) throw e;
+      await wait(1200);
+    }
+  }
+  throw new Error('CallData gagal setelah retry');
+}
+
+// ======== Swap Flow ========
+async function swapOnce(wallet) {
+  const addr = await wallet.getAddress();
+  const bal = await provider.getBalance(addr);
+  console.log(`→ Wallet: ${addr}`);
+  console.log(`  Balance: ${ethers.formatEther(bal)} PLUME`);
+
+  const amountWei = pickAmountWei(bal);
+  if (amountWei <= 0n) {
+    console.log('  ❗ Balance tidak cukup untuk swap (habis untuk gas). Skip.');
     return;
   }
 
-  // estimasi out + slippage
-  const amounts = await router.getAmountsOut(value, path);
-  const outNoSlip = amounts[amounts.length - 1];
-  const minOut = outNoSlip - (outNoSlip * BigInt(SLIPPAGE_BPS)) / 10000n;
+  console.log(`  Swap: ${ethers.formatEther(amountWei)} PLUME → pUSD`);
+  const cd = await buildCallData({ amountWei, recipient: addr });
 
-  const deadline = Math.floor(Date.now() / 1000) + DEADLINE_MIN * 60;
+  const txReq = { to: cd.to, data: cd.data, value: cd.value };
 
-  console.log(`  → Swap ${amountInEth} PLUME ⇒ pUSD (minOut ≈ ${ethers.formatUnits(minOut, 18)} pUSD)`);
+  try {
+    const gas = await wallet.estimateGas(txReq).catch(() => null);
+    if (gas) txReq.gasLimit = gas;
+  } catch (_) {}
 
-  const tx = await router.swapExactETHForTokens(
-    minOut,
-    path,
-    wallet.address,
-    deadline,
-    { value }
-  );
-  console.log(`    ⛓️  Tx sent: ${tx.hash}`);
+  const tx = await wallet.sendTransaction(txReq);
+  console.log(`  Tx sent: ${tx.hash}`);
   const rc = await tx.wait();
-  console.log(`    ✅ Confirmed in block ${rc.blockNumber}`);
+  console.log(`  ✅ Sukses. Block ${rc.blockNumber}. Explorer: https://explorer.plume.org/tx/${tx.hash}`);
 }
 
-async function main() {
-  const provider = new ethers.JsonRpcProvider(RPC, CHAIN_ID);
+async function run() {
+  await ensureChain();
 
-  // baca account.txt (1 pk per baris, boleh tanpa 0x)
-  const lines = readFileSync('account.txt', 'utf8').split(/\r?\n/).map(normPK).filter(Boolean);
-  if (lines.length === 0) throw new Error('account.txt kosong');
+  const pks = readPrivateKeys('account.txt');
+  if (pks.length === 0) throw new Error('account.txt kosong / tidak ditemukan.');
 
-  console.log(`=== Camelot Auto Swap (Plume ➜ pUSD) ===
-RPC        : ${RPC}
-Wallets    : ${lines.length}
-Router V2  : ${ROUTER_V2}
-Path       : WPLUME -> pUSD
-Slippage   : ${(SLIPPAGE_BPS/100).toFixed(2)}%
-`);
+  console.log('=== Rooster Auto Swap: PLUME → pUSD (Plume Mainnet) ===');
+  console.log(`RPC: ${PLUME_RPC}`);
+  console.log(`Loops per wallet: ${LOOPS}`);
+  console.log(`Delay: ${DELAY_MIN_SEC}-${DELAY_MAX_SEC}s | Mode: ${AMOUNT_MODE} (${MIN_PLUME}-${MAX_PLUME} PLUME)`);
 
-  for (let i = 0; i < lines.length; i++) {
-    console.log(`[${i+1}/${lines.length}] Wallet: ${new ethers.Wallet(lines[i]).address}`);
-    try {
-      await swapOneWallet(lines[i], provider);
-    } catch (e) {
-      console.error('  ❗ Error:', e.message);
+  for (const [i, pk] of pks.entries()) {
+    const wallet = new ethers.Wallet(pk, provider);
+    console.log(`\n[${i + 1}/${pks.length}]`);
+    for (let c = 1; c <= Number(LOOPS); c++) {
+      console.log(`  -- Cycle ${c}/${LOOPS} --`);
+      try {
+        await swapOnce(wallet);
+      } catch (e) {
+        console.log(`  ✖ Gagal swap: ${e.message || e}`);
+      }
+      if (c < Number(LOOPS)) await delayRandom();
     }
-    const delayS = rand(DELAY_MIN_S, DELAY_MAX_S);
-    console.log(`  … delay ${delayS}s\n`);
-    await sleep(delayS * 1000);
   }
-
-  console.log('=== Selesai ===');
+  console.log('\n=== Selesai ===');
 }
 
-main().catch(e => {
+run().catch(e => {
   console.error('Fatal:', e);
   process.exit(1);
 });
