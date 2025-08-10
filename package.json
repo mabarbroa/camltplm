@@ -1,0 +1,17 @@
+{
+  "name": "rooster-autoswap-plume",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Auto swap PLUME -> pUSD via Rooster CallData API (Plume 98866)",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
